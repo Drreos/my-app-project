@@ -5,13 +5,15 @@ load_dotenv()
 
 API_TOKEN = os.getenv("API_TOKEN")
 SUPPORT_CHAT_ID = int(os.getenv("SUPPORT_CHAT_ID", "-1002395996451"))
+TECH_SUPPORT_CHAT_ID = int(os.getenv("TECH_SUPPORT_CHAT_ID", "0"))
+SUPPORT_OWNER_ID = int(os.getenv("SUPPORT_OWNER_ID", "0"))
 MEDIA_GROUP_TIMEOUT = 2
 
 # PostgreSQL settings
 POSTGRES_USER = os.getenv("POSTGRES_USER", "botuser")
 POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD", "botpassword")
 POSTGRES_DB = os.getenv("POSTGRES_DB", "support_bot")
-POSTGRES_HOST = os.getenv("POSTGRES_HOST", "90.156.170.79")
+POSTGRES_HOST = os.getenv("POSTGRES_HOST", "db")
 POSTGRES_PORT = int(os.getenv("POSTGRES_PORT", "5432"))
 
 TOPICS = {

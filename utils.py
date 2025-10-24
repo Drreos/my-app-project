@@ -154,3 +154,14 @@ class MessageToHtmlConverter:
 
 def generate_ticket_id() -> str:
     return ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
+
+
+def build_topic_url(chat_id: int, thread_id: Optional[int]) -> Optional[str]:
+    if chat_id is None or thread_id is None:
+        return None
+    if chat_id >= 0:
+        return None
+    base = abs(chat_id) - 1_000_000_000_000
+    if base <= 0:
+        return None
+    return f"https://t.me/c/{base}/{thread_id}"

@@ -1,16 +1,46 @@
 import logging
 from datetime import datetime
 from aiogram import Bot, Dispatcher, F, Router
+from html import escape
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
-from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, BotCommand, BotCommandScopeAllPrivateChats, BotCommandScopeChat
+from aiogram.types import (
+    Message,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    CallbackQuery,
+    BotCommand,
+    BotCommandScopeAllPrivateChats,
+    BotCommandScopeChat,
+)
 from aiogram.types import Sticker, Animation
-from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
+from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramForbiddenError
 from typing import Optional  # Добавлен импорт для extract_reply_markup
-from config import API_TOKEN, SUPPORT_CHAT_ID, TRANSLATIONS, DEFAULT_LANGUAGE, MEDIA_GROUP_TIMEOUT, FAQ_QUESTIONS, TOPICS
-from database import get_ticket, get_user_by_thread, update_ticket_time, close_ticket, get_db_pool, update_user_language, get_user_language
-from utils import MessageToHtmlConverter, generate_ticket_id
+from config import (
+    API_TOKEN,
+    SUPPORT_CHAT_ID,
+    TECH_SUPPORT_CHAT_ID,
+    SUPPORT_OWNER_ID,
+    TRANSLATIONS,
+    DEFAULT_LANGUAGE,
+    MEDIA_GROUP_TIMEOUT,
+    FAQ_QUESTIONS,
+    TOPICS,
+)
+from database import (
+    get_ticket,
+    get_user_by_thread,
+    update_ticket_client_activity,
+    update_ticket_support_activity,
+    get_db_pool,
+    update_user_language,
+    get_user_language,
+    update_ticket_tech_thread,
+    save_ticket_message,
+    get_ticket_messages,
+)
+from utils import MessageToHtmlConverter, build_topic_url
 import asyncio
 
 logger = logging.getLogger(__name__)
@@ -184,8 +214,8 @@ def create_back_to_topics_keyboard(lang: str) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text=TRANSLATIONS[lang]["back"], callback_data="back_to_topics")]
     ])
 
-def create_close_ticket_keyboard(user_id: int, lang: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
+def create_close_ticket_keyboard(user_id: int, lang: str, tech_thread_id: Optional[int] = None) -> InlineKeyboardMarkup:
+    buttons = [
         [
             InlineKeyboardButton(
                 text="🔒 Закрыть тикет",
@@ -198,7 +228,55 @@ def create_close_ticket_keyboard(user_id: int, lang: str) -> InlineKeyboardMarku
                 url=f"https://t.me/MajesticGameBot?start=open_user_information_{user_id}"
             )
         ]
-    ])
+    ]
+
+    if TECH_SUPPORT_CHAT_ID:
+        if TECH_SUPPORT_CHAT_ID and tech_thread_id:
+            topic_url = build_topic_url(TECH_SUPPORT_CHAT_ID, tech_thread_id)
+            if topic_url:
+                buttons.append([
+                    InlineKeyboardButton(
+                        text="🛠 Открыть тех-чат",
+                        url=topic_url
+                    )
+                ])
+        else:
+            buttons.append([
+                InlineKeyboardButton(
+                    text="🛠 Создать чат техподдержки",
+                    callback_data=f"create_tech_ticket_{user_id}"
+                )
+            ])
+
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def create_tech_ticket_keyboard(user_id: int, support_thread_id: int) -> InlineKeyboardMarkup:
+    buttons = [
+        [
+            InlineKeyboardButton(
+                text="🦄 Информация о пользователе",
+                url=f"https://t.me/MajesticGameBot?start=open_user_information_{user_id}"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="🔒 Закрыть тех тикет",
+                callback_data=f"close_tech_ticket_{user_id}"
+            )
+        ]
+    ]
+
+    support_link = build_topic_url(SUPPORT_CHAT_ID, support_thread_id)
+    if support_link:
+        buttons.append([
+            InlineKeyboardButton(
+                text="💬 Чат с клиентом",
+                url=support_link
+            )
+        ])
+
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 async def create_forum_thread(user_id: int, topic: str, subtopic: str, lang: str) -> int:
     try:
@@ -226,12 +304,19 @@ async def create_forum_thread(user_id: int, topic: str, subtopic: str, lang: str
             name=title
         )
 
-        await bot.send_message(
+        details_message = await bot.send_message(
             chat_id=SUPPORT_CHAT_ID,
             text=user_details,
             message_thread_id=forum_topic.message_thread_id,
             reply_markup=create_close_ticket_keyboard(user_id, "ru"),
             parse_mode="HTML"
+        )
+
+        await save_ticket_message(
+            user_id,
+            details_message.message_id,
+            SUPPORT_CHAT_ID,
+            forum_topic.message_thread_id
         )
 
         return forum_topic.message_thread_id
@@ -289,7 +374,10 @@ async def process_language_selection(callback: CallbackQuery, state: FSMContext)
             parse_mode="HTML"
         )
         await callback.answer("Please try again.")
-    await callback.answer()
+    await callback.answer(
+        "Вы уверены, что хотите создать тикет с техническим отделом?",
+        show_alert=True
+    )
 
 @router.message(CommandStart(), F.chat.type == "private")
 async def cmd_start(message: Message, state: FSMContext):
@@ -305,9 +393,9 @@ async def cmd_start(message: Message, state: FSMContext):
     )
     await state.set_state(TicketStates.waiting_for_topic)
 
-    thread_id, status, _ = await get_ticket(user_id)
+    thread_id, status, _, tech_thread_id = await get_ticket(user_id)
     if status == "open":
-        await state.update_data(thread_id=thread_id)
+        await state.update_data(thread_id=thread_id, tech_thread_id=tech_thread_id)
 
 @router.callback_query(F.data == "back_to_topics")
 async def back_to_topics(callback: CallbackQuery, state: FSMContext):
@@ -324,7 +412,10 @@ async def back_to_topics(callback: CallbackQuery, state: FSMContext):
     except TelegramBadRequest as e:
         logger.warning(f"Message not modified for back_to_topics: {e}")
         await state.set_state(TicketStates.waiting_for_topic)
-    await callback.answer()
+    await callback.answer(
+        "Вы уверены, что хотите создать тикет с техническим отделом?",
+        show_alert=True
+    )
 
 @router.callback_query(F.data == "back_to_subpage")
 async def back_to_subpage(callback: CallbackQuery, state: FSMContext):
@@ -497,7 +588,7 @@ async def contact_operator(callback: CallbackQuery, state: FSMContext):
         subtopic = FAQ_QUESTIONS[topic][lang].get(subtopic_key, "Unknown subtopic")
 
     try:
-        thread_id, status, _ = await get_ticket(user_id)
+        thread_id, status, _, tech_thread_id = await get_ticket(user_id)
         if status == "open":
             converter = MessageToHtmlConverter(TRANSLATIONS[lang]["ticket_already_open"], None)
             await callback.message.edit_text(
@@ -509,7 +600,7 @@ async def contact_operator(callback: CallbackQuery, state: FSMContext):
             await callback.answer()
             return
 
-        await state.update_data(topic=topic, subtopic=subtopic)
+        await state.update_data(topic=topic, subtopic=subtopic, tech_thread_id=tech_thread_id)
         converter = MessageToHtmlConverter(TRANSLATIONS[lang]["describe_issue"], None)
         await callback.message.edit_text(
             converter.html,
@@ -544,37 +635,40 @@ async def create_ticket(message: Message, state: FSMContext):
 
     async with ticket_creation_locks[user_id]:
         try:
-            existing_thread_id, status, _ = await get_ticket(user_id)
+            existing_thread_id, status, _, tech_thread_id = await get_ticket(user_id)
             reply_markup = await extract_reply_markup(message)  # Извлечение клавиатуры
             if status == "open" and existing_thread_id:
                 await state.set_state(TicketStates.active_ticket)
-                await state.update_data(thread_id=existing_thread_id)
+                await state.update_data(thread_id=existing_thread_id, tech_thread_id=tech_thread_id)
                 if message.text:
                     converter = MessageToHtmlConverter(message.text, message.entities)
-                    await bot.send_message(
+                    sent_message = await bot.send_message(
                         SUPPORT_CHAT_ID,
                         converter.html,
                         message_thread_id=existing_thread_id,
                         reply_markup=reply_markup,  # Передача клавиатуры
                         parse_mode="HTML"
                     )
+                    await save_ticket_message(user_id, sent_message.message_id, SUPPORT_CHAT_ID, existing_thread_id)
                 elif message.sticker:
-                    await bot.send_sticker(
+                    sent_message = await bot.send_sticker(
                         SUPPORT_CHAT_ID,
                         message.sticker.file_id,
                         message_thread_id=existing_thread_id,
                         reply_markup=reply_markup  # Передача клавиатуры
                     )
+                    await save_ticket_message(user_id, sent_message.message_id, SUPPORT_CHAT_ID, existing_thread_id)
                 elif message.animation:
-                    await bot.send_animation(
+                    sent_message = await bot.send_animation(
                         SUPPORT_CHAT_ID,
                         message.animation.file_id,
                         message_thread_id=existing_thread_id,
                         reply_markup=reply_markup  # Передача клавиатуры
                     )
+                    await save_ticket_message(user_id, sent_message.message_id, SUPPORT_CHAT_ID, existing_thread_id)
                 elif message.photo:
                     converter = MessageToHtmlConverter(message.caption, message.caption_entities)
-                    await bot.send_photo(
+                    sent_message = await bot.send_photo(
                         SUPPORT_CHAT_ID,
                         message.photo[-1].file_id,
                         caption=converter.html,
@@ -582,7 +676,8 @@ async def create_ticket(message: Message, state: FSMContext):
                         reply_markup=reply_markup,  # Передача клавиатуры
                         parse_mode="HTML"
                     )
-                await update_ticket_time(user_id)
+                    await save_ticket_message(user_id, sent_message.message_id, SUPPORT_CHAT_ID, existing_thread_id)
+                await update_ticket_client_activity(user_id)
                 return
 
             thread_id = await create_forum_thread(user_id, topic, subtopic, "ru")
@@ -593,37 +688,46 @@ async def create_ticket(message: Message, state: FSMContext):
                     INSERT INTO tickets (user_id, thread_id, status, topic, last_message_time) 
                     VALUES ($1, $2, $3, $4, $5)
                     ON CONFLICT (user_id) DO UPDATE 
-                    SET thread_id = $2, status = $3, topic = $4, last_message_time = $5
+                    SET thread_id = $2,
+                        status = $3,
+                        topic = $4,
+                        last_message_time = $5,
+                        support_reminder_sent = FALSE,
+                        tech_reminder_sent = FALSE,
+                        tech_thread_id = NULL
                     """,
                     user_id, thread_id, "open", topic, datetime.now()
                 )
 
             if message.text:
                 converter = MessageToHtmlConverter(message.text, message.entities)
-                await bot.send_message(
+                sent_message = await bot.send_message(
                     SUPPORT_CHAT_ID,
                     converter.html,
                     message_thread_id=thread_id,
                     reply_markup=reply_markup,  # Передача клавиатуры
                     parse_mode="HTML"
                 )
+                await save_ticket_message(user_id, sent_message.message_id, SUPPORT_CHAT_ID, thread_id)
             elif message.sticker:
-                await bot.send_sticker(
+                sent_message = await bot.send_sticker(
                     SUPPORT_CHAT_ID,
                     message.sticker.file_id,
                     message_thread_id=thread_id,
                     reply_markup=reply_markup  # Передача клавиатуры
                 )
+                await save_ticket_message(user_id, sent_message.message_id, SUPPORT_CHAT_ID, thread_id)
             elif message.animation:
-                await bot.send_animation(
+                sent_message = await bot.send_animation(
                     SUPPORT_CHAT_ID,
                     message.animation.file_id,
                     message_thread_id=thread_id,
                     reply_markup=reply_markup  # Передача клавиатуры
                 )
+                await save_ticket_message(user_id, sent_message.message_id, SUPPORT_CHAT_ID, thread_id)
             elif message.photo:
                 converter = MessageToHtmlConverter(message.caption, message.caption_entities)
-                await bot.send_photo(
+                sent_message = await bot.send_photo(
                     SUPPORT_CHAT_ID,
                     message.photo[-1].file_id,
                     caption=converter.html,
@@ -631,6 +735,7 @@ async def create_ticket(message: Message, state: FSMContext):
                     reply_markup=reply_markup,  # Передача клавиатуры
                     parse_mode="HTML"
                 )
+                await save_ticket_message(user_id, sent_message.message_id, SUPPORT_CHAT_ID, thread_id)
 
             converter = MessageToHtmlConverter(TRANSLATIONS[lang]["ticket_submitted"], None)
             await message.answer(
@@ -638,8 +743,10 @@ async def create_ticket(message: Message, state: FSMContext):
                 parse_mode="HTML"
             )
 
+            await update_ticket_client_activity(user_id)
+
             await state.set_state(TicketStates.active_ticket)
-            await state.update_data(thread_id=thread_id)
+            await state.update_data(thread_id=thread_id, tech_thread_id=None)
 
         except Exception as e:
             logger.error(f"Error creating ticket: {e}", exc_info=True)
@@ -655,6 +762,7 @@ async def forward_to_support(message: Message, state: FSMContext):
     lang = await get_language(user_id, language_code=message.from_user.language_code)
     data = await state.get_data()
     thread_id = data.get("thread_id")
+    tech_thread_id = data.get("tech_thread_id")
 
     if not thread_id:
         converter = MessageToHtmlConverter(TRANSLATIONS[lang]["error"], None)
@@ -672,7 +780,16 @@ async def forward_to_support(message: Message, state: FSMContext):
         return
 
     try:
-        _, status, _ = await get_ticket(user_id)
+        current_thread_id, status, _, db_tech_thread_id = await get_ticket(user_id)
+
+        if current_thread_id and current_thread_id != thread_id:
+            thread_id = current_thread_id
+            await state.update_data(thread_id=thread_id)
+
+        if db_tech_thread_id != tech_thread_id:
+            tech_thread_id = db_tech_thread_id
+            await state.update_data(tech_thread_id=tech_thread_id)
+
         if status != "open":
             converter = MessageToHtmlConverter(TRANSLATIONS[lang]["ticket_closed_message"], None)
             await message.answer(
@@ -692,30 +809,33 @@ async def forward_to_support(message: Message, state: FSMContext):
 
         if message.text:
             converter = MessageToHtmlConverter(message.text, message.entities)
-            await bot.send_message(
+            sent_message = await bot.send_message(
                 SUPPORT_CHAT_ID,
                 converter.html,
                 message_thread_id=thread_id,
                 reply_markup=reply_markup,  # Передача клавиатуры
                 parse_mode="HTML"
             )
+            await save_ticket_message(user_id, sent_message.message_id, SUPPORT_CHAT_ID, thread_id)
         elif message.sticker:
-            await bot.send_sticker(
+            sent_message = await bot.send_sticker(
                 SUPPORT_CHAT_ID,
                 message.sticker.file_id,
                 message_thread_id=thread_id,
                 reply_markup=reply_markup  # Передача клавиатуры
             )
+            await save_ticket_message(user_id, sent_message.message_id, SUPPORT_CHAT_ID, thread_id)
         elif message.animation:
-            await bot.send_animation(
+            sent_message = await bot.send_animation(
                 SUPPORT_CHAT_ID,
                 message.animation.file_id,
                 message_thread_id=thread_id,
                 reply_markup=reply_markup  # Передача клавиатуры
             )
+            await save_ticket_message(user_id, sent_message.message_id, SUPPORT_CHAT_ID, thread_id)
         elif message.photo:
             converter = MessageToHtmlConverter(message.caption, message.caption_entities)
-            await bot.send_photo(
+            sent_message = await bot.send_photo(
                 SUPPORT_CHAT_ID,
                 message.photo[-1].file_id,
                 caption=converter.html,
@@ -723,8 +843,9 @@ async def forward_to_support(message: Message, state: FSMContext):
                 reply_markup=reply_markup,  # Передача клавиатуры
                 parse_mode="HTML"
             )
+            await save_ticket_message(user_id, sent_message.message_id, SUPPORT_CHAT_ID, thread_id)
 
-        await update_ticket_time(user_id)
+        await update_ticket_client_activity(user_id)
 
     except Exception as e:
         logger.error(f"Error forwarding message: {e}")
@@ -739,11 +860,11 @@ async def handle_random_message(message: Message, state: FSMContext):
     user_id = message.from_user.id
     lang = await get_language(user_id, language_code=message.from_user.language_code)
 
-    thread_id, status, _ = await get_ticket(user_id)
+    thread_id, status, _, tech_thread_id = await get_ticket(user_id)
 
     if status == "open":
         await state.set_state(TicketStates.active_ticket)
-        await state.update_data(thread_id=thread_id)
+        await state.update_data(thread_id=thread_id, tech_thread_id=tech_thread_id)
         await forward_to_support(message, state)
     else:
         async with (await get_db_pool()).acquire() as conn:
@@ -766,20 +887,276 @@ async def handle_random_message(message: Message, state: FSMContext):
         )
         await state.clear()
 
+@router.callback_query(F.data.startswith("create_tech_ticket_"))
+async def prompt_tech_ticket(callback: CallbackQuery):
+    if not TECH_SUPPORT_CHAT_ID:
+        await callback.answer("Технический чат не настроен", show_alert=True)
+        return
+
+    user_id = int(callback.data.split("_")[-1])
+    thread_id = callback.message.message_thread_id
+    source_message_id = callback.message.message_id
+
+    _, _, _, tech_thread_id = await get_ticket(user_id)
+    if tech_thread_id:
+        thread_active = True
+        try:
+            await bot.send_chat_action(
+                chat_id=TECH_SUPPORT_CHAT_ID,
+                action="typing",
+                message_thread_id=tech_thread_id
+            )
+        except (TelegramBadRequest, TelegramForbiddenError) as exc:
+            logger.warning(f"Stored tech thread {tech_thread_id} invalid for user {user_id}: {exc}")
+            async with (await get_db_pool()).acquire() as conn:
+                await conn.execute(
+                    "UPDATE tickets SET tech_thread_id = NULL WHERE user_id = $1",
+                    user_id
+                )
+            thread_active = False
+
+        if thread_active:
+            markup = create_close_ticket_keyboard(user_id, "ru", tech_thread_id=tech_thread_id)
+            try:
+                await bot.edit_message_reply_markup(
+                    chat_id=SUPPORT_CHAT_ID,
+                    message_id=source_message_id,
+                    reply_markup=markup
+                )
+            except TelegramBadRequest as exc:
+                logger.warning(f"Failed to update support keyboard for existing tech chat: {exc}")
+
+            await callback.answer("Технический чат уже создан", show_alert=True)
+            return
+        else:
+            tech_thread_id = None
+
+    confirm_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(
+                text="✅ Да",
+                callback_data=f"confirm_tech_ticket_yes_{user_id}_{thread_id}_{source_message_id}"
+            ),
+            InlineKeyboardButton(
+                text="❌ Нет",
+                callback_data=f"confirm_tech_ticket_no_{source_message_id}"
+            )
+        ]
+    ])
+
+    await callback.answer()
+    await bot.send_message(
+        chat_id=SUPPORT_CHAT_ID,
+        text="Вы уверены, что хотите создать тикет с техническим отделом?",
+        reply_markup=confirm_keyboard,
+        message_thread_id=thread_id
+    )
+
+
+@router.callback_query(F.data.startswith("confirm_tech_ticket_no_"))
+async def cancel_tech_ticket(callback: CallbackQuery):
+    try:
+        await callback.message.delete()
+    except TelegramBadRequest as exc:
+        logger.warning(f"Failed to delete confirmation message: {exc}")
+    await callback.answer("Создание тикета отменено")
+
+
+@router.callback_query(F.data.startswith("confirm_tech_ticket_yes_"))
+async def confirm_tech_ticket(callback: CallbackQuery):
+    if not TECH_SUPPORT_CHAT_ID:
+        await callback.answer("Технический чат не настроен", show_alert=True)
+        return
+
+    parts = callback.data.split("_")
+    try:
+        user_id = int(parts[4])
+        expected_thread_id = int(parts[5])
+        source_message_id = int(parts[6])
+    except (IndexError, ValueError):
+        await callback.answer("Не удалось обработать запрос", show_alert=True)
+        return
+
+    support_thread_id, status, topic, existing_tech_thread_id = await get_ticket(user_id)
+    if status != "open" or support_thread_id != expected_thread_id:
+        await callback.answer("Актуальный тикет не найден", show_alert=True)
+        await callback.message.delete()
+        return
+
+    if existing_tech_thread_id:
+        markup = create_close_ticket_keyboard(user_id, "ru", tech_thread_id=existing_tech_thread_id)
+        try:
+            await bot.edit_message_reply_markup(
+                chat_id=SUPPORT_CHAT_ID,
+                message_id=source_message_id,
+                reply_markup=markup
+            )
+        except TelegramBadRequest as exc:
+            logger.warning(f"Failed to update support keyboard: {exc}")
+        await callback.answer("Технический чат уже существует", show_alert=True)
+        await callback.message.delete()
+        return
+
+    try:
+        user_info = await bot.get_chat(user_id)
+    except TelegramAPIError as exc:
+        logger.error(f"Failed to load user info for tech ticket: {exc}")
+        await callback.answer("Не удалось получить данные пользователя", show_alert=True)
+        await callback.message.delete()
+        return
+
+    username = f"@{user_info.username}" if user_info.username else f"user{user_id}"
+    first_name = user_info.first_name or "N/A"
+    last_name = user_info.last_name or "N/A"
+
+    topic_name_ru = TRANSLATIONS["ru"]["topics"].get(topic, topic or "Не указано")
+    title = f"🛠 ТЕХ: {topic_name_ru} - id{user_id}"
+
+    try:
+        forum_topic = await bot.create_forum_topic(
+            chat_id=TECH_SUPPORT_CHAT_ID,
+            name=title
+        )
+    except TelegramAPIError as exc:
+        logger.error(f"Failed to create tech forum topic: {exc}")
+        await callback.answer("Не удалось создать чат технической поддержки", show_alert=True)
+        await callback.message.delete()
+        return
+
+    support_link = build_topic_url(SUPPORT_CHAT_ID, support_thread_id)
+    user_details = (
+        f"<b>👤 Пользователь:</b> <code>{escape(first_name)} {escape(last_name)}</code>\n"
+        f"<b>🆔 ID:</b> <code>{user_id}</code>\n"
+        f"<b>📧 Username:</b> <code>{escape(username)}</code>\n"
+        f"<b>📌 Тема:</b> <code>{escape(topic_name_ru)}</code>\n"
+    )
+    if support_link:
+        user_details += f'<b>💬 Поддержка:</b> <a href="{support_link}">Открыть чат</a>\n'
+    user_details += f"<b>⏰ Создан:</b> <code>{datetime.now().strftime('%Y-%m-%d %H:%M')}</code>\n"
+    user_details += "────────────────────"
+
+    try:
+        await bot.send_message(
+            chat_id=TECH_SUPPORT_CHAT_ID,
+            text=user_details,
+            message_thread_id=forum_topic.message_thread_id,
+            reply_markup=create_tech_ticket_keyboard(user_id, support_thread_id),
+            parse_mode="HTML"
+        )
+    except TelegramAPIError as exc:
+        logger.error(f"Failed to send tech ticket details: {exc}")
+        await callback.answer("Не удалось заполнить чат технической поддержки", show_alert=True)
+        await callback.message.delete()
+        return
+
+    await update_ticket_tech_thread(user_id, forum_topic.message_thread_id)
+
+    message_ids = await get_ticket_messages(user_id, support_thread_id)
+    for mid in message_ids:
+        try:
+            await bot.copy_message(
+                chat_id=TECH_SUPPORT_CHAT_ID,
+                from_chat_id=SUPPORT_CHAT_ID,
+                message_id=mid,
+                message_thread_id=forum_topic.message_thread_id
+            )
+        except TelegramAPIError as exc:
+            logger.warning(f"Failed to copy message {mid} to tech chat: {exc}")
+
+    markup = create_close_ticket_keyboard(user_id, "ru", tech_thread_id=forum_topic.message_thread_id)
+    try:
+        await bot.edit_message_reply_markup(
+            chat_id=SUPPORT_CHAT_ID,
+            message_id=source_message_id,
+            reply_markup=markup
+        )
+    except TelegramBadRequest as exc:
+        logger.warning(f"Failed to update support keyboard after tech chat creation: {exc}")
+
+    try:
+        await callback.message.delete()
+    except TelegramBadRequest as exc:
+        logger.warning(f"Failed to delete confirmation message: {exc}")
+
+    await callback.answer("Создан чат технической поддержки")
+
+
+@router.callback_query(F.data.startswith("close_tech_ticket_"))
+async def close_tech_ticket(callback: CallbackQuery):
+    if not TECH_SUPPORT_CHAT_ID:
+        await callback.answer("Технический чат не настроен", show_alert=True)
+        return
+
+    if SUPPORT_OWNER_ID and callback.from_user.id != SUPPORT_OWNER_ID:
+        await callback.answer("Закрывать тикет может только владелец", show_alert=True)
+        return
+
+    user_id = int(callback.data.split("_")[-1])
+    tech_thread_id = callback.message.message_thread_id
+
+    support_thread_id, _, topic, stored_tech_thread_id = await get_ticket(user_id)
+    if stored_tech_thread_id and stored_tech_thread_id != tech_thread_id:
+        logger.warning(f"Tech thread mismatch for user {user_id}")
+
+    topic_name_ru = TRANSLATIONS["ru"]["topics"].get(topic, topic)
+
+    try:
+        await bot.close_forum_topic(
+            chat_id=TECH_SUPPORT_CHAT_ID,
+            message_thread_id=tech_thread_id
+        )
+    except TelegramAPIError as exc:
+        logger.error(f"Failed to close tech ticket for user {user_id}: {exc}")
+        await callback.answer("Не удалось закрыть тикет", show_alert=True)
+        return
+
+    async with (await get_db_pool()).acquire() as conn:
+        await conn.execute(
+            "UPDATE tickets SET tech_thread_id = NULL WHERE user_id = $1",
+            user_id
+        )
+
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.answer("Технический тикет закрыт")
+
+    if support_thread_id and topic:
+        topic_name_ru = TRANSLATIONS["ru"]["topics"].get(topic, topic)
+        try:
+            notification = await bot.send_message(
+                chat_id=SUPPORT_CHAT_ID,
+                text=f"Технический тикет по теме <b>{topic_name_ru}</b> закрыт.",
+                message_thread_id=support_thread_id,
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                    InlineKeyboardButton(
+                        text="🛠 Создать чат техподдержки",
+                        callback_data=f"create_tech_ticket_{user_id}"
+                    )
+                ]])
+            )
+            await save_ticket_message(user_id, notification.message_id, SUPPORT_CHAT_ID, support_thread_id)
+        except TelegramAPIError as exc:
+            logger.warning(f"Failed to notify support chat about tech closure: {exc}")
+
+
 @router.callback_query(F.data.startswith("close_ticket_"))
 async def close_ticket_button(callback: CallbackQuery, state: FSMContext):
     user_id = int(callback.data.split("_")[-1])
     thread_id = callback.message.message_thread_id
 
+    if SUPPORT_OWNER_ID and callback.from_user.id != SUPPORT_OWNER_ID:
+        await callback.answer("Закрывать тикет может только владелец", show_alert=True)
+        return
+
     try:
-        _, status, topic = await get_ticket(user_id)
+        _, status, topic, tech_thread_id = await get_ticket(user_id)
         if status != "open":
             await callback.answer("Тикет уже закрыт")
             return
 
         async with (await get_db_pool()).acquire() as conn:
             await conn.execute(
-                "UPDATE tickets SET status = 'closed' WHERE user_id = $1",
+                "UPDATE tickets SET status = 'closed', tech_thread_id = NULL WHERE user_id = $1",
                 user_id
             )
 
@@ -798,6 +1175,40 @@ async def close_ticket_button(callback: CallbackQuery, state: FSMContext):
             chat_id=SUPPORT_CHAT_ID,
             message_thread_id=thread_id
         )
+
+        if tech_thread_id:
+            tech_topic_name = f"🔒 ТЕХ: {topic_name_ru} - id{user_id}"
+            try:
+                await bot.edit_forum_topic(
+                    chat_id=TECH_SUPPORT_CHAT_ID,
+                    message_thread_id=tech_thread_id,
+                    name=tech_topic_name
+                )
+            except TelegramAPIError as exc:
+                logger.warning(f"Failed to rename tech topic for user {user_id}: {exc}")
+
+            close_notice = "❗️ Тикет закрыт командой поддержки."
+            support_link = build_topic_url(SUPPORT_CHAT_ID, thread_id)
+            if support_link:
+                close_notice += f'\n<a href="{support_link}">Перейти к диалогу</a>'
+
+            try:
+                await bot.send_message(
+                    chat_id=TECH_SUPPORT_CHAT_ID,
+                    text=close_notice,
+                    message_thread_id=tech_thread_id,
+                    parse_mode="HTML"
+                )
+            except TelegramAPIError as exc:
+                logger.warning(f"Failed to notify tech chat about closure for user {user_id}: {exc}")
+
+            try:
+                await bot.close_forum_topic(
+                    chat_id=TECH_SUPPORT_CHAT_ID,
+                    message_thread_id=tech_thread_id
+                )
+            except TelegramAPIError as exc:
+                logger.error(f"Failed to close tech thread for user {user_id}: {exc}")
 
         await callback.answer("Тикет закрыт")
         await callback.message.edit_reply_markup(reply_markup=None)
@@ -828,6 +1239,7 @@ async def forward_to_user(message: Message, state: FSMContext):
         return
 
     try:
+        await save_ticket_message(user_id, message.message_id, SUPPORT_CHAT_ID, thread_id)
         reply_markup = await extract_reply_markup(message)  # Извлечение клавиатуры
 
         if message.text:
@@ -860,7 +1272,7 @@ async def forward_to_user(message: Message, state: FSMContext):
                 parse_mode="HTML"
             )
 
-        await update_ticket_time(user_id)
+        await update_ticket_support_activity(user_id)
 
     except Exception as e:
         logger.error(f"Error forwarding to user {user_id}: {e}")

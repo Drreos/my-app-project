@@ -1,9 +1,25 @@
 services:
+  db:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-botuser}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-botpassword}
+      POSTGRES_DB: ${POSTGRES_DB:-support_bot}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+
   bot:
     build: .
     env_file:
       - .env
     volumes:
       - .:/app
+    depends_on:
+      - db
     restart: unless-stopped
 
+volumes:
+  postgres_data:
