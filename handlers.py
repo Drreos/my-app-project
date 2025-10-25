@@ -1168,31 +1168,38 @@ async def close_ticket_button(callback: CallbackQuery, state: FSMContext):
 
     try:
         _, status, topic, tech_thread_id = await get_ticket(user_id)
-        if status != "open":
-            await callback.answer("Тикет уже закрыт")
-            return
+        already_closed = status == "closed"
 
-        async with (await get_db_pool()).acquire() as conn:
-            await conn.execute(
-                "UPDATE tickets SET status = 'closed', tech_thread_id = NULL WHERE user_id = $1",
-                user_id
-            )
-
+        topic_name_ru = get_topic_display(topic)
         user_info = await bot.get_chat(user_id)
         username = f"@{user_info.username}" if user_info.username else f"user{user_id}"
-        topic_name_ru = get_topic_display(topic)
         new_name = f"🔒 ЗАКРЫТО: {topic_name_ru} - {username}"
 
-        await bot.edit_forum_topic(
-            chat_id=SUPPORT_CHAT_ID,
-            message_thread_id=thread_id,
-            name=new_name
-        )
+        def _is_benign_topic_error(exc: TelegramAPIError) -> bool:
+            message = getattr(exc, "message", str(exc))
+            benign_markers = ("TOPIC_NOT_MODIFIED", "FORUM_TOPIC_CLOSED")
+            return isinstance(exc, TelegramBadRequest) and any(marker in message for marker in benign_markers)
 
-        await bot.close_forum_topic(
-            chat_id=SUPPORT_CHAT_ID,
-            message_thread_id=thread_id
-        )
+        try:
+            await bot.edit_forum_topic(
+                chat_id=SUPPORT_CHAT_ID,
+                message_thread_id=thread_id,
+                name=new_name
+            )
+        except TelegramAPIError as exc:
+            if not _is_benign_topic_error(exc):
+                raise
+            logger.debug(f"Support topic already renamed for user {user_id}: {exc}")
+
+        try:
+            await bot.close_forum_topic(
+                chat_id=SUPPORT_CHAT_ID,
+                message_thread_id=thread_id
+            )
+        except TelegramAPIError as exc:
+            if not _is_benign_topic_error(exc):
+                raise
+            logger.debug(f"Support topic already closed for user {user_id}: {exc}")
 
         if tech_thread_id:
             tech_topic_name = f"🔒 ТЕХ: {topic_name_ru} - id{user_id}"
@@ -1203,7 +1210,10 @@ async def close_ticket_button(callback: CallbackQuery, state: FSMContext):
                     name=tech_topic_name
                 )
             except TelegramAPIError as exc:
-                logger.warning(f"Failed to rename tech topic for user {user_id}: {exc}")
+                if _is_benign_topic_error(exc):
+                    logger.debug(f"Tech topic already renamed for user {user_id}: {exc}")
+                else:
+                    logger.warning(f"Failed to rename tech topic for user {user_id}: {exc}")
 
             close_notice = "❗️ Тикет закрыт командой поддержки."
             support_link = build_topic_url(SUPPORT_CHAT_ID, thread_id)
@@ -1226,10 +1236,26 @@ async def close_ticket_button(callback: CallbackQuery, state: FSMContext):
                     message_thread_id=tech_thread_id
                 )
             except TelegramAPIError as exc:
-                logger.error(f"Failed to close tech thread for user {user_id}: {exc}")
+                if _is_benign_topic_error(exc):
+                    logger.debug(f"Tech topic already closed for user {user_id}: {exc}")
+                else:
+                    logger.error(f"Failed to close tech thread for user {user_id}: {exc}")
+                if not _is_benign_topic_error(exc):
+                    raise
 
-        await callback.answer("Тикет закрыт")
-        await callback.message.edit_reply_markup(reply_markup=None)
+        async with (await get_db_pool()).acquire() as conn:
+            await conn.execute(
+                "UPDATE tickets SET status = 'closed', tech_thread_id = NULL WHERE user_id = $1",
+                user_id
+            )
+
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except TelegramBadRequest as exc:
+            if "MESSAGE_NOT_MODIFIED" not in getattr(exc, "message", str(exc)):
+                logger.warning(f"Failed to remove close button for user {user_id}: {exc}")
+
+        await callback.answer("Тикет закрыт" if not already_closed else "Тикет уже был закрыт")
 
         try:
             await state.clear()
