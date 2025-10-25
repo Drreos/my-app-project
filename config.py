@@ -1,20 +1,51 @@
 import os
+import logging
 from dotenv import load_dotenv
 
 load_dotenv()
 
+logger = logging.getLogger(__name__)
+
 API_TOKEN = os.getenv("API_TOKEN")
 SUPPORT_CHAT_ID = int(os.getenv("SUPPORT_CHAT_ID", "-1002395996451"))
 TECH_SUPPORT_CHAT_ID = int(os.getenv("TECH_SUPPORT_CHAT_ID", "0"))
-SUPPORT_OWNER_ID = int(os.getenv("SUPPORT_OWNER_ID", "0"))
 MEDIA_GROUP_TIMEOUT = 2
+
+def _parse_id_list(raw: str | None) -> list[int]:
+    if not raw:
+        return []
+    ids: list[int] = []
+    for part in raw.replace(";", ",").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            ids.append(int(part))
+        except ValueError:
+            logger.warning("Invalid ID '%s' in owner list", part)
+    return ids
+
+
+SUPPORT_OWNER_IDS = _parse_id_list(os.getenv("SUPPORT_OWNER_IDS"))
+legacy_support_owner = os.getenv("SUPPORT_OWNER_ID", "").strip()
+if legacy_support_owner:
+    try:
+        legacy_id = int(legacy_support_owner)
+        if legacy_id not in SUPPORT_OWNER_IDS:
+            SUPPORT_OWNER_IDS.append(legacy_id)
+    except ValueError:
+        logger.warning("Invalid SUPPORT_OWNER_ID value: %s", legacy_support_owner)
+
+TECH_OWNER_IDS = _parse_id_list(
+    os.getenv("TECH_OWNER_IDS") or os.getenv("TECH_OWNER_ID") or os.getenv("TECH_WNER_ID")
+)
 
 # PostgreSQL settings
 POSTGRES_USER = os.getenv("POSTGRES_USER", "botuser")
 POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD", "botpassword")
 POSTGRES_DB = os.getenv("POSTGRES_DB", "support_bot")
 POSTGRES_HOST = os.getenv("POSTGRES_HOST", "db")
-POSTGRES_PORT = int(os.getenv("POSTGRES_PORT", "5432"))
+POSTGRES_PORT = int(os.getenv("POSTGRES_PORT", "5433"))
 
 TOPICS = {
     "balance": "💰 Balance",

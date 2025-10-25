@@ -21,7 +21,8 @@ from config import (
     API_TOKEN,
     SUPPORT_CHAT_ID,
     TECH_SUPPORT_CHAT_ID,
-    SUPPORT_OWNER_ID,
+    SUPPORT_OWNER_IDS,
+    TECH_OWNER_IDS,
     TRANSLATIONS,
     DEFAULT_LANGUAGE,
     MEDIA_GROUP_TIMEOUT,
@@ -51,6 +52,11 @@ dp = Dispatcher()
 dp.include_router(router)
 user_languages = {}
 ticket_creation_locks = {}
+
+def get_topic_display(topic: Optional[str]) -> str:
+    if topic and topic in TRANSLATIONS["ru"]["topics"]:
+        return TRANSLATIONS["ru"]["topics"][topic]
+    return topic or "Не указан"
 
 class TicketStates(StatesGroup):
     waiting_for_topic = State()
@@ -285,7 +291,7 @@ async def create_forum_thread(user_id: int, topic: str, subtopic: str, lang: str
         first_name = user_info.first_name or "N/A"
         last_name = user_info.last_name or "N/A"
 
-        topic_name_ru = TRANSLATIONS["ru"]["topics"][topic]
+        topic_name_ru = get_topic_display(topic)
         subtopic_text = subtopic or "Не указан"
 
         title = f"🟢 ОТКРЫТО: {topic_name_ru} - id{user_id}"
@@ -1087,7 +1093,10 @@ async def close_tech_ticket(callback: CallbackQuery):
         await callback.answer("Технический чат не настроен", show_alert=True)
         return
 
-    if SUPPORT_OWNER_ID and callback.from_user.id != SUPPORT_OWNER_ID:
+    allowed_tech_ids = set(TECH_OWNER_IDS or [])
+    if SUPPORT_OWNER_IDS:
+        allowed_tech_ids.update(SUPPORT_OWNER_IDS)
+    if allowed_tech_ids and callback.from_user.id not in allowed_tech_ids:
         await callback.answer("Закрывать тикет может только владелец", show_alert=True)
         return
 
@@ -1098,7 +1107,15 @@ async def close_tech_ticket(callback: CallbackQuery):
     if stored_tech_thread_id and stored_tech_thread_id != tech_thread_id:
         logger.warning(f"Tech thread mismatch for user {user_id}")
 
-    topic_name_ru = TRANSLATIONS["ru"]["topics"].get(topic, topic)
+    topic_name_ru = get_topic_display(topic)
+    try:
+        await bot.edit_forum_topic(
+            chat_id=TECH_SUPPORT_CHAT_ID,
+            message_thread_id=tech_thread_id,
+            name=f"🔒 ТЕХ: {topic_name_ru} - id{user_id}"
+        )
+    except TelegramAPIError as exc:
+        logger.warning(f"Failed to rename tech topic for user {user_id}: {exc}")
 
     try:
         await bot.close_forum_topic(
@@ -1119,8 +1136,8 @@ async def close_tech_ticket(callback: CallbackQuery):
     await callback.message.edit_reply_markup(reply_markup=None)
     await callback.answer("Технический тикет закрыт")
 
-    if support_thread_id and topic:
-        topic_name_ru = TRANSLATIONS["ru"]["topics"].get(topic, topic)
+    if support_thread_id:
+        topic_name_ru = get_topic_display(topic)
         try:
             notification = await bot.send_message(
                 chat_id=SUPPORT_CHAT_ID,
@@ -1144,7 +1161,8 @@ async def close_ticket_button(callback: CallbackQuery, state: FSMContext):
     user_id = int(callback.data.split("_")[-1])
     thread_id = callback.message.message_thread_id
 
-    if SUPPORT_OWNER_ID and callback.from_user.id != SUPPORT_OWNER_ID:
+    allowed_support_ids = set(SUPPORT_OWNER_IDS or [])
+    if allowed_support_ids and callback.from_user.id not in allowed_support_ids:
         await callback.answer("Закрывать тикет может только владелец", show_alert=True)
         return
 
@@ -1162,7 +1180,7 @@ async def close_ticket_button(callback: CallbackQuery, state: FSMContext):
 
         user_info = await bot.get_chat(user_id)
         username = f"@{user_info.username}" if user_info.username else f"user{user_id}"
-        topic_name_ru = TRANSLATIONS["ru"]["topics"][topic]
+        topic_name_ru = get_topic_display(topic)
         new_name = f"🔒 ЗАКРЫТО: {topic_name_ru} - {username}"
 
         await bot.edit_forum_topic(
