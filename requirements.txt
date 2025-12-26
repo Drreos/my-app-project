@@ -1,0 +1,20 @@
+# Telegram Bot Framework
+aiogram==3.4.1
+aiohttp==3.9.3
+
+# Database
+asyncpg==0.29.0
+
+# Environment variables
+python-dotenv==1.0.1
+
+# OpenAI for AI Assistant (используем последнюю совместимую версию)
+openai==1.54.0
+httpx==0.27.0
+
+# HTML parsing and utilities
+html5lib==1.1
+
+# Logging and debugging
+python-json-logger==2.0.7
+

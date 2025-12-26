@@ -47,6 +47,19 @@ POSTGRES_DB = os.getenv("POSTGRES_DB", "support_bot")
 POSTGRES_HOST = os.getenv("POSTGRES_HOST", "db")
 POSTGRES_PORT = int(os.getenv("POSTGRES_PORT", "5433"))
 
+# AI Assistant settings
+AI_ENABLED = os.getenv("AI_ENABLED", "true").lower() == "true"
+AI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+AI_MODEL = os.getenv("AI_MODEL", "gpt-4o-mini")
+AI_MAX_TOKENS = int(os.getenv("AI_MAX_TOKENS", "1000"))
+AI_TEMPERATURE = float(os.getenv("AI_TEMPERATURE", "0.7"))
+AI_AUTO_RESPOND = os.getenv("AI_AUTO_RESPOND", "true").lower() == "true"
+AI_MAX_RESPONSES = int(os.getenv("AI_MAX_RESPONSES", "2"))  # Максимум ответов ИИ до передачи оператору
+
+# Auto-close settings
+AUTO_CLOSE_ENABLED = os.getenv("AUTO_CLOSE_ENABLED", "true").lower() == "true"
+AUTO_CLOSE_HOURS = int(os.getenv("AUTO_CLOSE_HOURS", "1"))  # Закрывать тикет если клиент не отвечает N часов
+
 TOPICS = {
     "balance": "💰 Balance",
     "withdrop": "🎁️ Withdrawal",

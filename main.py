@@ -3,7 +3,7 @@ import logging
 from contextlib import suppress
 from datetime import datetime, timezone, timedelta
 
-from config import API_TOKEN, SUPPORT_CHAT_ID, TECH_SUPPORT_CHAT_ID
+from config import API_TOKEN, SUPPORT_CHAT_ID, TECH_SUPPORT_CHAT_ID, AUTO_CLOSE_ENABLED, AUTO_CLOSE_HOURS
 from database import (
     init_db,
     get_open_tickets_for_reminders,
@@ -11,6 +11,7 @@ from database import (
     mark_tech_reminder_sent,
     mark_close_reminder_sent,
     save_ticket_message,
+    auto_close_ticket,
 )
 from handlers import dp, bot, setup_bot_commands
 
@@ -39,7 +40,13 @@ CLOSE_REMINDER_TEXT = (
     "Если вопрос решён, пожалуйста, закройте тикет."
 )
 
+AUTO_CLOSE_SUPPORT_TEXT = (
+    "🔒 <b>Тикет автоматически закрыт:</b> клиент не отвечал более {hours} час(а/ов). "
+    "Если потребуется, клиент может создать новый тикет."
+)
 
+# ToDO: Стоит задача создать inlinekeyboards  в чате поддрежки при созалние кнопки для технического отдала Преоритетный тикер, Проблема вывода, Другие проблемы, Не пришел депозит
+# ToDO: Тип будет покзаываться в название темы тикера!
 async def main():
     logger.info("Starting bot...")
     if not API_TOKEN:
@@ -85,6 +92,7 @@ async def reminder_worker(
     close_overdue_hours: int = 8
 ):
     logger.info("Reminder worker started")
+    logger.info(f"⚙️  Auto-close enabled: {AUTO_CLOSE_ENABLED}, timeout: {AUTO_CLOSE_HOURS} hour(s)")
     sleep_seconds = max(interval_minutes, 1) * 60
     while True:
         try:
@@ -92,6 +100,7 @@ async def reminder_worker(
             now = datetime.now(timezone.utc)
             client_delta = timedelta(minutes=client_overdue_minutes)
             close_delta = timedelta(hours=close_overdue_hours)
+            auto_close_delta = timedelta(hours=AUTO_CLOSE_HOURS)
 
             for ticket in tickets:
                 user_id = ticket["user_id"]
@@ -156,6 +165,51 @@ async def reminder_worker(
                         await mark_close_reminder_sent(user_id)
                     except Exception as exc:
                         logger.error(f"Failed to send close reminder for user {user_id}: {exc}")
+                
+                # Автоматическое закрытие тикета если клиент не отвечает
+                if (
+                    AUTO_CLOSE_ENABLED
+                    and thread_id
+                    and last_support  # Поддержка ответила
+                    and (not last_client or last_support > last_client)  # Последнее сообщение от поддержки
+                    and now - last_support >= auto_close_delta  # Прошло N часов
+                ):
+                    try:
+                        # Закрываем тикет в БД (клиент НЕ получает уведомления - тихое закрытие)
+                        await auto_close_ticket(user_id)
+                        
+                        # Пытаемся отправить уведомление в чат поддержки
+                        try:
+                            message = await bot.send_message(
+                                chat_id=SUPPORT_CHAT_ID,
+                                text=AUTO_CLOSE_SUPPORT_TEXT.format(hours=AUTO_CLOSE_HOURS),
+                                message_thread_id=thread_id,
+                                parse_mode="HTML"
+                            )
+                            await save_ticket_message(user_id, message.message_id, SUPPORT_CHAT_ID, thread_id)
+                        except Exception as exc:
+                            # Тема форума не найдена - значит уже закрыта вручную, это нормально
+                            if "message thread not found" in str(exc).lower():
+                                logger.debug(f"Thread {thread_id} not found for user {user_id} (already closed manually)")
+                            else:
+                                logger.warning(f"Failed to send auto-close message for user {user_id}: {exc}")
+                        
+                        # Пытаемся закрыть тему форума
+                        try:
+                            await bot.close_forum_topic(
+                                chat_id=SUPPORT_CHAT_ID,
+                                message_thread_id=thread_id
+                            )
+                            logger.info(f"✅ Ticket auto-closed successfully for user {user_id}")
+                        except Exception as exc:
+                            # Тема форума не найдена - значит уже закрыта, это нормально
+                            if "message thread not found" in str(exc).lower():
+                                logger.debug(f"Thread {thread_id} already closed for user {user_id}")
+                            else:
+                                logger.warning(f"Failed to close forum topic for user {user_id}: {exc}")
+                            
+                    except Exception as exc:
+                        logger.error(f"Failed to auto-close ticket for user {user_id}: {exc}")
 
         except asyncio.CancelledError:
             logger.info("Reminder worker cancelled")

@@ -40,8 +40,13 @@ from database import (
     update_ticket_tech_thread,
     save_ticket_message,
     get_ticket_messages,
+    mark_ai_responded,
+    check_if_human_responded,
+    get_ai_response_count,
+    mark_human_responded,
 )
 from utils import MessageToHtmlConverter, build_topic_url
+from ai_assistant import ai_assistant
 import asyncio
 
 logger = logging.getLogger(__name__)
@@ -52,6 +57,27 @@ dp = Dispatcher()
 dp.include_router(router)
 user_languages = {}
 ticket_creation_locks = {}
+
+async def safe_callback_answer(callback: CallbackQuery, text: str = "", show_alert: bool = False) -> bool:
+    """
+    Безопасно отвечает на callback query, игнорируя ошибки устаревших запросов.
+    Возвращает True если ответ был отправлен успешно, False в противном случае.
+    """
+    try:
+        await callback.answer(text, show_alert=show_alert)
+        return True
+    except TelegramBadRequest as exc:
+        error_msg = str(exc).lower()
+        if "query is too old" in error_msg or "query id is invalid" in error_msg:
+            logger.info(f"Ignoring old/invalid callback query: {exc}")
+            return False
+        else:
+            # Для других ошибок прокидываем исключение выше
+            logger.error(f"Callback answer failed: {exc}")
+            raise
+    except Exception as exc:
+        logger.error(f"Unexpected error in callback answer: {exc}")
+        raise
 
 def get_topic_display(topic: Optional[str]) -> str:
     if topic and topic in TRANSLATIONS["ru"]["topics"]:
@@ -284,7 +310,7 @@ def create_tech_ticket_keyboard(user_id: int, support_thread_id: int) -> InlineK
 
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-async def create_forum_thread(user_id: int, topic: str, subtopic: str, lang: str) -> int:
+async def create_forum_thread(user_id: int, topic: str, subtopic: str, lang: str, first_message: str = "") -> int:
     try:
         user_info = await bot.get_chat(user_id)
         username = f"@{user_info.username}" if user_info.username else f"user{user_id}"
@@ -294,7 +320,13 @@ async def create_forum_thread(user_id: int, topic: str, subtopic: str, lang: str
         topic_name_ru = get_topic_display(topic)
         subtopic_text = subtopic or "Не указан"
 
-        title = f"🟢 ОТКРЫТО: {topic_name_ru} - id{user_id}"
+        # Генерируем умное название с помощью ИИ
+        if first_message:
+            ai_title = await ai_assistant.generate_thread_title(first_message, topic, lang)
+            title = f"{ai_title} | id{user_id}"
+        else:
+            # Fallback если нет первого сообщения
+            title = f"🟢 ОТКРЫТО: {topic_name_ru} - id{user_id}"
         user_details = (
             f"<b>👤 Пользователь:</b> <code>{first_name} {last_name}</code>\n"
             f"<b>🆔 ID:</b> <code>{user_id}</code>\n"
@@ -337,6 +369,262 @@ async def extract_reply_markup(message: Message) -> Optional[InlineKeyboardMarku
         return message.reply_markup
     logger.debug(f"No reply_markup found in message {message.message_id}")
     return None
+
+
+async def send_ai_response_to_client(user_id: int, user_message: str, lang: str, topic: Optional[str] = None):
+    """
+    Отправляет автоматический ответ ИИ клиенту (невидимо для клиента).
+    Клиент не знает что это ИИ - выглядит как обычный ответ поддержки.
+    """
+    from config import AI_ENABLED, AI_AUTO_RESPOND, AI_MAX_RESPONSES
+    from ai_assistant import detect_strong_emotion, ai_wants_to_escalate
+    from database import get_ai_response_count
+    
+    logger.info(f"🤖 ========== AI AUTO-RESPONSE START ==========")
+    logger.info(f"🤖 User ID: {user_id}")
+    logger.info(f"🤖 Message: {user_message[:100]}")
+    logger.info(f"🤖 Language: {lang}")
+    logger.info(f"🤖 Topic: {topic}")
+    logger.info(f"🤖 AI_ENABLED: {AI_ENABLED}")
+    logger.info(f"🤖 AI_AUTO_RESPOND: {AI_AUTO_RESPOND}")
+    
+    if not AI_ENABLED:
+        logger.warning(f"⚠️  AI is disabled globally")
+        return
+        
+    if not AI_AUTO_RESPOND:
+        logger.warning(f"⚠️  AI auto-respond is disabled")
+        return
+    
+    # Проверяем, не ответил ли уже оператор
+    logger.info(f"🔍 Checking if human already responded to user {user_id}...")
+    human_responded = await check_if_human_responded(user_id)
+    logger.info(f"🔍 Human responded: {human_responded}")
+    
+    if human_responded:
+        logger.info(f"👨‍💼 Human already responded to user {user_id}, skipping AI")
+        return
+    
+    # Проверяем количество ответов ИИ (только для статистики)
+    ai_count = await get_ai_response_count(user_id)
+    logger.info(f"📊 AI response count: {ai_count} (unlimited until human responds)")
+    
+    # Если AI уже ответил 3+ раза без ответа оператора - эскалируем
+    if ai_count >= 3:
+        logger.info(f"🔄 AI answered {ai_count} times already, escalating to human operator")
+        
+        # Отвечаем пользователю профессионально
+        translations = {
+            "ru": "Занимаемся изучением вашей проблемы. Скоро вернёмся с решением.",
+            "en": "We're investigating your issue. Will get back to you with a solution soon.",
+            "uz": "Muammoingizni o'rganmoqdamiz. Tez orada yechim bilan qaytamiz."
+        }
+        await bot.send_message(
+            chat_id=user_id,
+            text=translations.get(lang, translations["ru"])
+        )
+        
+        # Уведомляем чат поддержки и меняем название темы
+        try:
+            ticket_info = await get_ticket(user_id)
+            if ticket_info:
+                thread_id = ticket_info[0]
+                _, _, topic_name, _, _, _ = ticket_info
+                if thread_id:
+                    # Меняем название темы на "🚨 ОПЕРАТОР"
+                    try:
+                        topic_display = get_topic_display(topic_name) if topic_name else "Вопрос"
+                        new_title = f"🚨 ОПЕРАТОР: {topic_display} - id{user_id}"
+                        await bot.edit_forum_topic(
+                            chat_id=SUPPORT_CHAT_ID,
+                            message_thread_id=thread_id,
+                            name=new_title
+                        )
+                        logger.info(f"✏️ Thread title updated to: {new_title}")
+                    except Exception as e:
+                        logger.error(f"Failed to update thread title: {e}")
+                    
+                    # Отправляем алерт
+                    alert_message = (
+                        "🚨 <b>ТРЕБУЕТСЯ ОПЕРАТОР!</b> 🚨\n\n"
+                        "⚠️ AI уже ответил 3+ раза, но проблема не решена.\n"
+                        "📞 Необходима помощь живого оператора!\n\n"
+                        f"💬 Последнее сообщение клиента:\n<blockquote>{user_message[:200]}</blockquote>"
+                    )
+                    await bot.send_message(
+                        chat_id=SUPPORT_CHAT_ID,
+                        text=alert_message,
+                        message_thread_id=thread_id,
+                        parse_mode="HTML"
+                    )
+                    logger.info(f"🚨 Alert sent to support chat for user {user_id} (AI response limit reached)")
+        except Exception as e:
+            logger.error(f"Failed to send alert to support chat: {e}")
+        
+        # Помечаем что нужен человек
+        await mark_human_responded(user_id)
+        return
+    
+    # Проверяем наличие сильных эмоций/мата/технических проблем
+    if detect_strong_emotion(user_message):
+        logger.info(f"😡 Strong emotion/technical issue detected! Escalating to human operator immediately")
+        
+        # Отвечаем профессионально
+        translations = {
+            "ru": "Понял вас. Занимаемся изучением вашей проблемы и скоро вернёмся с решением.",
+            "en": "I understand. We're investigating your issue and will get back to you with a solution soon.",
+            "uz": "Tushundim. Muammoingizni o'rganmoqdamiz va tez orada yechim bilan qaytamiz."
+        }
+        await bot.send_message(
+            chat_id=user_id,
+            text=translations.get(lang, translations["ru"])
+        )
+        
+        # Уведомляем чат поддержки и меняем название темы
+        try:
+            ticket_info = await get_ticket(user_id)
+            if ticket_info:
+                thread_id = ticket_info[0]
+                _, _, topic_name, _, _, _ = ticket_info
+                if thread_id:
+                    # Меняем название темы на "🚨 ОПЕРАТОР"
+                    try:
+                        topic_display = get_topic_display(topic_name) if topic_name else "Проблема"
+                        new_title = f"🚨 ОПЕРАТОР: {topic_display} - id{user_id}"
+                        await bot.edit_forum_topic(
+                            chat_id=SUPPORT_CHAT_ID,
+                            message_thread_id=thread_id,
+                            name=new_title
+                        )
+                        logger.info(f"✏️ Thread title updated to: {new_title}")
+                    except Exception as e:
+                        logger.error(f"Failed to update thread title: {e}")
+                    
+                    # Отправляем алерт
+                    alert_message = (
+                        "🚨 <b>ТРЕБУЕТСЯ ОПЕРАТОР!</b> 🚨\n\n"
+                        "⚠️ Обнаружена техническая проблема или сильные эмоции.\n"
+                        "📞 Необходима помощь живого оператора!\n\n"
+                        f"💬 Сообщение клиента:\n<blockquote>{user_message[:200]}</blockquote>"
+                    )
+                    await bot.send_message(
+                        chat_id=SUPPORT_CHAT_ID,
+                        text=alert_message,
+                        message_thread_id=thread_id,
+                        parse_mode="HTML"
+                    )
+                    logger.info(f"🚨 Alert sent to support chat for user {user_id}")
+        except Exception as e:
+            logger.error(f"Failed to send alert to support chat: {e}")
+        
+        # Помечаем что нужен человек (он ответит дальше)
+        await mark_human_responded(user_id)
+        return
+    
+    try:
+        # Получаем ответ от ИИ
+        context = {"topic": topic} if topic else None
+        logger.info(f"📞 Calling ai_assistant.get_ai_response...")
+        
+        ai_response = await ai_assistant.get_ai_response(
+            user_message=user_message,
+            lang=lang,
+            context=context
+        )
+        
+        logger.info(f"📨 AI response received: {ai_response is not None}")
+        
+        if ai_response:
+            logger.info(f"💬 AI response length: {len(ai_response)}")
+            logger.info(f"💬 AI response preview: {ai_response[:100]}...")
+            
+            # Отправляем ответ клиенту (БЕЗ упоминания что это ИИ!)
+            converter = MessageToHtmlConverter(ai_response, None)
+            logger.info(f"📤 Sending AI response to user {user_id}...")
+            
+            await bot.send_message(
+                chat_id=user_id,
+                text=converter.html,
+                parse_mode="HTML"
+            )
+            
+            logger.info(f"✅ Message sent to user {user_id}")
+            
+            # Отправляем ответ ИИ в чат поддержки для контекста
+            try:
+                ticket_info = await get_ticket(user_id)
+                if ticket_info:
+                    thread_id = ticket_info[0]  # thread_id первый элемент
+                    if thread_id:
+                        ai_marker = "🤖 <b>[ОТВЕТ ИИ]</b>\n\n" + converter.html
+                        await bot.send_message(
+                            chat_id=SUPPORT_CHAT_ID,
+                            text=ai_marker,
+                            message_thread_id=thread_id,
+                            parse_mode="HTML"
+                        )
+                        logger.info(f"📨 AI response forwarded to support chat (thread {thread_id})")
+            except Exception as e:
+                logger.error(f"❌ Failed to forward AI response to support chat: {e}")
+            
+            # Проверяем - хочет ли AI передать вопрос оператору
+            if ai_wants_to_escalate(ai_response):
+                logger.info(f"🔄 AI wants to escalate - sending alert to operator")
+                
+                # Отправляем алерт оператору и меняем название темы
+                try:
+                    ticket_info = await get_ticket(user_id)
+                    if ticket_info:
+                        thread_id = ticket_info[0]
+                        _, _, topic_name, _, _, _ = ticket_info
+                        if thread_id:
+                            # Меняем название темы на "🚨 ОПЕРАТОР"
+                            try:
+                                topic_display = get_topic_display(topic_name) if topic_name else "Вопрос"
+                                new_title = f"🚨 ОПЕРАТОР: {topic_display} - id{user_id}"
+                                await bot.edit_forum_topic(
+                                    chat_id=SUPPORT_CHAT_ID,
+                                    message_thread_id=thread_id,
+                                    name=new_title
+                                )
+                                logger.info(f"✏️ Thread title updated to: {new_title}")
+                            except Exception as e:
+                                logger.error(f"Failed to update thread title: {e}")
+                            
+                            # Отправляем алерт
+                            alert_message = (
+                                "🚨 <b>ТРЕБУЕТСЯ ОПЕРАТОР!</b> 🚨\n\n"
+                                "⚠️ AI передал вопрос оператору (не знает ответа).\n"
+                                "📞 Необходима помощь живого оператора!\n\n"
+                                f"💬 Сообщение клиента:\n<blockquote>{user_message[:200]}</blockquote>"
+                            )
+                            await bot.send_message(
+                                chat_id=SUPPORT_CHAT_ID,
+                                text=alert_message,
+                                message_thread_id=thread_id,
+                                parse_mode="HTML"
+                            )
+                            logger.info(f"🚨 Escalation alert sent to support chat for user {user_id}")
+                except Exception as e:
+                    logger.error(f"Failed to send escalation alert: {e}")
+                
+                # Помечаем что нужен человек
+                await mark_human_responded(user_id)
+                logger.info(f"✅ Escalated to human operator")
+            else:
+                # Отмечаем что ИИ ответил (обычный ответ)
+                logger.info(f"🏷️  Marking AI responded for user {user_id}...")
+                await mark_ai_responded(user_id)
+                logger.info(f"✅ AI responded flag set")
+            
+            logger.info(f"🎉 AI AUTO-RESPONSE SUCCESS for user {user_id}")
+        else:
+            logger.error(f"❌ AI could not generate response for user {user_id}")
+            
+    except Exception as e:
+        logger.error(f"💥 Error sending AI auto-response to user {user_id}: {e}", exc_info=True)
+    
+    logger.info(f"🤖 ========== AI AUTO-RESPONSE END ==========")
 
 @router.message(Command("lang"), F.chat.type == "private")
 async def cmd_lang(message: Message, state: FSMContext):
@@ -399,7 +687,7 @@ async def cmd_start(message: Message, state: FSMContext):
     )
     await state.set_state(TicketStates.waiting_for_topic)
 
-    thread_id, status, _, tech_thread_id = await get_ticket(user_id)
+    thread_id, status, _, tech_thread_id, _, _ = await get_ticket(user_id)
     if status == "open":
         await state.update_data(thread_id=thread_id, tech_thread_id=tech_thread_id)
 
@@ -562,6 +850,7 @@ async def show_faq_answer(callback: CallbackQuery, state: FSMContext):
             reply_markup=create_faq_answer_keyboard(lang, topic),
             parse_mode="HTML"
         )
+        await state.update_data(topic=topic)
         await state.set_state(TicketStates.waiting_for_faq_answer)
     except TelegramBadRequest as e:
         logger.warning(f"Message not modified for FAQ answer {callback.data}: {e}")
@@ -594,7 +883,7 @@ async def contact_operator(callback: CallbackQuery, state: FSMContext):
         subtopic = FAQ_QUESTIONS[topic][lang].get(subtopic_key, "Unknown subtopic")
 
     try:
-        thread_id, status, _, tech_thread_id = await get_ticket(user_id)
+        thread_id, status, _, tech_thread_id, _, _ = await get_ticket(user_id)
         if status == "open":
             converter = MessageToHtmlConverter(TRANSLATIONS[lang]["ticket_already_open"], None)
             await callback.message.edit_text(
@@ -641,7 +930,7 @@ async def create_ticket(message: Message, state: FSMContext):
 
     async with ticket_creation_locks[user_id]:
         try:
-            existing_thread_id, status, _, tech_thread_id = await get_ticket(user_id)
+            existing_thread_id, status, _, tech_thread_id, _, _ = await get_ticket(user_id)
             reply_markup = await extract_reply_markup(message)  # Извлечение клавиатуры
             if status == "open" and existing_thread_id:
                 await state.set_state(TicketStates.active_ticket)
@@ -686,7 +975,16 @@ async def create_ticket(message: Message, state: FSMContext):
                 await update_ticket_client_activity(user_id)
                 return
 
-            thread_id = await create_forum_thread(user_id, topic, subtopic, "ru")
+            # ⚡ СРАЗУ отправляем базовое сообщение пользователю для быстрой обратной связи
+            converter = MessageToHtmlConverter(TRANSLATIONS[lang]["ticket_submitted"], None)
+            await message.answer(
+                converter.html,
+                parse_mode="HTML"
+            )
+
+            # Получаем текст первого сообщения для ИИ-названия темы
+            first_msg_text = message.text or (message.caption if message.photo else "")
+            thread_id = await create_forum_thread(user_id, topic, subtopic, "ru", first_msg_text)
 
             async with (await get_db_pool()).acquire() as conn:
                 await conn.execute(
@@ -700,10 +998,14 @@ async def create_ticket(message: Message, state: FSMContext):
                         last_message_time = $5,
                         support_reminder_sent = FALSE,
                         tech_reminder_sent = FALSE,
-                        tech_thread_id = NULL
+                        tech_thread_id = NULL,
+                        human_responded = FALSE,
+                        ai_responded = FALSE,
+                        ai_response_count = 0
                     """,
                     user_id, thread_id, "open", topic, datetime.now()
                 )
+                logger.info(f"🔄 New ticket created, AI counters reset for user {user_id}")
 
             if message.text:
                 converter = MessageToHtmlConverter(message.text, message.entities)
@@ -743,16 +1045,16 @@ async def create_ticket(message: Message, state: FSMContext):
                 )
                 await save_ticket_message(user_id, sent_message.message_id, SUPPORT_CHAT_ID, thread_id)
 
-            converter = MessageToHtmlConverter(TRANSLATIONS[lang]["ticket_submitted"], None)
-            await message.answer(
-                converter.html,
-                parse_mode="HTML"
-            )
-
             await update_ticket_client_activity(user_id)
 
             await state.set_state(TicketStates.active_ticket)
             await state.update_data(thread_id=thread_id, tech_thread_id=None)
+            
+            # Автоматически отвечаем через ИИ на первое сообщение
+            if message.text:
+                logger.info(f"🎯 Creating AI response task for user {user_id}, message: {message.text[:50]}")
+                asyncio.create_task(send_ai_response_to_client(user_id, message.text, lang, topic))
+                logger.info(f"✅ AI response task created")
 
         except Exception as e:
             logger.error(f"Error creating ticket: {e}", exc_info=True)
@@ -786,7 +1088,7 @@ async def forward_to_support(message: Message, state: FSMContext):
         return
 
     try:
-        current_thread_id, status, _, db_tech_thread_id = await get_ticket(user_id)
+        current_thread_id, status, _, db_tech_thread_id, human_responded, _ = await get_ticket(user_id)
 
         if current_thread_id and current_thread_id != thread_id:
             thread_id = current_thread_id
@@ -852,6 +1154,21 @@ async def forward_to_support(message: Message, state: FSMContext):
             await save_ticket_message(user_id, sent_message.message_id, SUPPORT_CHAT_ID, thread_id)
 
         await update_ticket_client_activity(user_id)
+        
+        # Извлекаем текст сообщения (text или caption для фото)
+        user_message_text = message.text or (message.caption if message.photo else None)
+        
+        # Автоматически отвечаем через ИИ, если оператор еще не ответил
+        logger.info(f"📋 Checking AI eligibility for user {user_id}: has_text={bool(user_message_text)}, human_responded={human_responded}")
+        
+        if user_message_text and not human_responded:
+            logger.info(f"🎯 Creating AI response task for follow-up message from user {user_id}")
+            asyncio.create_task(send_ai_response_to_client(user_id, user_message_text, lang))
+            logger.info(f"✅ AI response task created")
+        elif human_responded:
+            logger.info(f"👨‍💼 Human has responded, not calling AI for user {user_id}")
+        elif not user_message_text:
+            logger.info(f"📝 No text in message (sticker/animation/voice), not calling AI for user {user_id}")
 
     except Exception as e:
         logger.error(f"Error forwarding message: {e}")
@@ -866,11 +1183,11 @@ async def handle_random_message(message: Message, state: FSMContext):
     user_id = message.from_user.id
     lang = await get_language(user_id, language_code=message.from_user.language_code)
 
-    thread_id, status, _, tech_thread_id = await get_ticket(user_id)
+    thread_id, status, topic, tech_thread_id, _, _ = await get_ticket(user_id)
 
     if status == "open":
         await state.set_state(TicketStates.active_ticket)
-        await state.update_data(thread_id=thread_id, tech_thread_id=tech_thread_id)
+        await state.update_data(thread_id=thread_id, tech_thread_id=tech_thread_id, topic=topic)
         await forward_to_support(message, state)
     else:
         async with (await get_db_pool()).acquire() as conn:
@@ -896,14 +1213,14 @@ async def handle_random_message(message: Message, state: FSMContext):
 @router.callback_query(F.data.startswith("create_tech_ticket_"))
 async def prompt_tech_ticket(callback: CallbackQuery):
     if not TECH_SUPPORT_CHAT_ID:
-        await callback.answer("Технический чат не настроен", show_alert=True)
+        await safe_callback_answer(callback, "Технический чат не настроен", show_alert=True)
         return
 
     user_id = int(callback.data.split("_")[-1])
     thread_id = callback.message.message_thread_id
     source_message_id = callback.message.message_id
 
-    _, _, _, tech_thread_id = await get_ticket(user_id)
+    _, _, _, tech_thread_id, _, _ = await get_ticket(user_id)
     if tech_thread_id:
         thread_active = True
         try:
@@ -932,7 +1249,7 @@ async def prompt_tech_ticket(callback: CallbackQuery):
             except TelegramBadRequest as exc:
                 logger.warning(f"Failed to update support keyboard for existing tech chat: {exc}")
 
-            await callback.answer("Технический чат уже создан", show_alert=True)
+            await safe_callback_answer(callback, "Технический чат уже создан", show_alert=True)
             return
         else:
             tech_thread_id = None
@@ -950,7 +1267,7 @@ async def prompt_tech_ticket(callback: CallbackQuery):
         ]
     ])
 
-    await callback.answer()
+    await safe_callback_answer(callback)
     await bot.send_message(
         chat_id=SUPPORT_CHAT_ID,
         text="Вы уверены, что хотите создать тикет с техническим отделом?",
@@ -965,13 +1282,13 @@ async def cancel_tech_ticket(callback: CallbackQuery):
         await callback.message.delete()
     except TelegramBadRequest as exc:
         logger.warning(f"Failed to delete confirmation message: {exc}")
-    await callback.answer("Создание тикета отменено")
+    await safe_callback_answer(callback, "Создание тикета отменено")
 
 
 @router.callback_query(F.data.startswith("confirm_tech_ticket_yes_"))
 async def confirm_tech_ticket(callback: CallbackQuery):
     if not TECH_SUPPORT_CHAT_ID:
-        await callback.answer("Технический чат не настроен", show_alert=True)
+        await safe_callback_answer(callback, "Технический чат не настроен", show_alert=True)
         return
 
     parts = callback.data.split("_")
@@ -980,12 +1297,12 @@ async def confirm_tech_ticket(callback: CallbackQuery):
         expected_thread_id = int(parts[5])
         source_message_id = int(parts[6])
     except (IndexError, ValueError):
-        await callback.answer("Не удалось обработать запрос", show_alert=True)
+        await safe_callback_answer(callback, "Не удалось обработать запрос", show_alert=True)
         return
 
-    support_thread_id, status, topic, existing_tech_thread_id = await get_ticket(user_id)
+    support_thread_id, status, topic, existing_tech_thread_id, _, _ = await get_ticket(user_id)
     if status != "open" or support_thread_id != expected_thread_id:
-        await callback.answer("Актуальный тикет не найден", show_alert=True)
+        await safe_callback_answer(callback, "Актуальный тикет не найден", show_alert=True)
         await callback.message.delete()
         return
 
@@ -999,7 +1316,7 @@ async def confirm_tech_ticket(callback: CallbackQuery):
             )
         except TelegramBadRequest as exc:
             logger.warning(f"Failed to update support keyboard: {exc}")
-        await callback.answer("Технический чат уже существует", show_alert=True)
+        await safe_callback_answer(callback, "Технический чат уже существует", show_alert=True)
         await callback.message.delete()
         return
 
@@ -1007,7 +1324,7 @@ async def confirm_tech_ticket(callback: CallbackQuery):
         user_info = await bot.get_chat(user_id)
     except TelegramAPIError as exc:
         logger.error(f"Failed to load user info for tech ticket: {exc}")
-        await callback.answer("Не удалось получить данные пользователя", show_alert=True)
+        await safe_callback_answer(callback, "Не удалось получить данные пользователя", show_alert=True)
         await callback.message.delete()
         return
 
@@ -1025,7 +1342,7 @@ async def confirm_tech_ticket(callback: CallbackQuery):
         )
     except TelegramAPIError as exc:
         logger.error(f"Failed to create tech forum topic: {exc}")
-        await callback.answer("Не удалось создать чат технической поддержки", show_alert=True)
+        await safe_callback_answer(callback, "Не удалось создать чат технической поддержки", show_alert=True)
         await callback.message.delete()
         return
 
@@ -1051,7 +1368,7 @@ async def confirm_tech_ticket(callback: CallbackQuery):
         )
     except TelegramAPIError as exc:
         logger.error(f"Failed to send tech ticket details: {exc}")
-        await callback.answer("Не удалось заполнить чат технической поддержки", show_alert=True)
+        await safe_callback_answer(callback, "Не удалось заполнить чат технической поддержки", show_alert=True)
         await callback.message.delete()
         return
 
@@ -1084,26 +1401,26 @@ async def confirm_tech_ticket(callback: CallbackQuery):
     except TelegramBadRequest as exc:
         logger.warning(f"Failed to delete confirmation message: {exc}")
 
-    await callback.answer("Создан чат технической поддержки")
+    await safe_callback_answer(callback, "Создан чат технической поддержки")
 
 
 @router.callback_query(F.data.startswith("close_tech_ticket_"))
 async def close_tech_ticket(callback: CallbackQuery):
     if not TECH_SUPPORT_CHAT_ID:
-        await callback.answer("Технический чат не настроен", show_alert=True)
+        await safe_callback_answer(callback, "Технический чат не настроен", show_alert=True)
         return
 
     allowed_tech_ids = set(TECH_OWNER_IDS or [])
     if SUPPORT_OWNER_IDS:
         allowed_tech_ids.update(SUPPORT_OWNER_IDS)
     if allowed_tech_ids and callback.from_user.id not in allowed_tech_ids:
-        await callback.answer("Закрывать тикет может только владелец", show_alert=True)
+        await safe_callback_answer(callback, "Закрывать тикет может только владелец", show_alert=True)
         return
 
     user_id = int(callback.data.split("_")[-1])
     tech_thread_id = callback.message.message_thread_id
 
-    support_thread_id, _, topic, stored_tech_thread_id = await get_ticket(user_id)
+    support_thread_id, _, topic, stored_tech_thread_id, _, _ = await get_ticket(user_id)
     if stored_tech_thread_id and stored_tech_thread_id != tech_thread_id:
         logger.warning(f"Tech thread mismatch for user {user_id}")
 
@@ -1124,7 +1441,7 @@ async def close_tech_ticket(callback: CallbackQuery):
         )
     except TelegramAPIError as exc:
         logger.error(f"Failed to close tech ticket for user {user_id}: {exc}")
-        await callback.answer("Не удалось закрыть тикет", show_alert=True)
+        await safe_callback_answer(callback, "Не удалось закрыть тикет", show_alert=True)
         return
 
     async with (await get_db_pool()).acquire() as conn:
@@ -1134,7 +1451,7 @@ async def close_tech_ticket(callback: CallbackQuery):
         )
 
     await callback.message.edit_reply_markup(reply_markup=None)
-    await callback.answer("Технический тикет закрыт")
+    await safe_callback_answer(callback, "Технический тикет закрыт")
 
     if support_thread_id:
         topic_name_ru = get_topic_display(topic)
@@ -1163,11 +1480,11 @@ async def close_ticket_button(callback: CallbackQuery, state: FSMContext):
 
     allowed_support_ids = set(SUPPORT_OWNER_IDS or [])
     if allowed_support_ids and callback.from_user.id not in allowed_support_ids:
-        await callback.answer("Закрывать тикет может только владелец", show_alert=True)
+        await safe_callback_answer(callback, "Закрывать тикет может только владелец", show_alert=True)
         return
 
     try:
-        _, status, topic, tech_thread_id = await get_ticket(user_id)
+        _, status, topic, tech_thread_id, _, _ = await get_ticket(user_id)
         already_closed = status == "closed"
 
         topic_name_ru = get_topic_display(topic)
@@ -1255,7 +1572,7 @@ async def close_ticket_button(callback: CallbackQuery, state: FSMContext):
             if "MESSAGE_NOT_MODIFIED" not in getattr(exc, "message", str(exc)):
                 logger.warning(f"Failed to remove close button for user {user_id}: {exc}")
 
-        await callback.answer("Тикет закрыт" if not already_closed else "Тикет уже был закрыт")
+        await safe_callback_answer(callback, "Тикет закрыт" if not already_closed else "Тикет уже был закрыт")
 
         try:
             await state.clear()
@@ -1271,7 +1588,7 @@ async def close_ticket_button(callback: CallbackQuery, state: FSMContext):
 
     except Exception as e:
         logger.error(f"Error closing ticket: {e}")
-        await callback.answer("Ошибка при закрытии тикета")
+        await safe_callback_answer(callback, "Ошибка при закрытии тикета")
 
 @router.message(F.chat.id == SUPPORT_CHAT_ID, F.is_topic_message)
 async def forward_to_user(message: Message, state: FSMContext):
@@ -1281,6 +1598,19 @@ async def forward_to_user(message: Message, state: FSMContext):
     if not user_id:
         logger.error(f"User not found for thread {thread_id}")
         return
+    
+    # ВАЖНО: Проверяем что сообщение НЕ от бота!
+    bot_info = await bot.get_me()
+    is_from_bot = message.from_user.id == bot_info.id
+    
+    # Проверяем что это НЕ сообщение ИИ (с меткой 🤖)
+    is_ai_message = message.text and "🤖" in message.text and "[ОТВЕТ ИИ]" in message.text
+    
+    if is_ai_message:
+        logger.info(f"🤖 AI message detected in support chat, not forwarding to user {user_id}")
+        return  # НЕ пересылаем ИИ-сообщения клиенту (он уже получил их напрямую)
+    
+    logger.info(f"📨 Message in support chat from user {message.from_user.id}, is_from_bot={is_from_bot}")
 
     try:
         await save_ticket_message(user_id, message.message_id, SUPPORT_CHAT_ID, thread_id)
@@ -1316,7 +1646,12 @@ async def forward_to_user(message: Message, state: FSMContext):
                 parse_mode="HTML"
             )
 
-        await update_ticket_support_activity(user_id)
+        # Устанавливаем human_responded ТОЛЬКО если сообщение от ЧЕЛОВЕКА (не от бота)!
+        if not is_from_bot:
+            logger.info(f"👨‍💼 Human operator responded to user {user_id}, setting human_responded=TRUE")
+            await update_ticket_support_activity(user_id)
+        else:
+            logger.info(f"🤖 Bot message ignored, not setting human_responded for user {user_id}")
 
     except Exception as e:
         logger.error(f"Error forwarding to user {user_id}: {e}")
